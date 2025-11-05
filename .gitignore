@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Datos/Resultados
+results/
+*.csv
+*.png
+
+# VSCode
+.vscode/
+
+# Conda
+*.conda
+*.lock
+.env
