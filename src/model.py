@@ -23,8 +23,8 @@ class EvacuationModel(Model):
         height=25,
         N=300,
         num_exits=3,
-        exit_widths=None,         # lista de anchos (m) por salida
-        persons_speed_cells=1,    # celdas por tick (discreto)
+        exit_widths=None,         
+        persons_speed_cells=1,   
         seed=None,
         time_step=0.1
     ):
@@ -41,6 +41,9 @@ class EvacuationModel(Model):
         self.schedule = RandomActivation(self)
         self.grid = MultiGrid(width, height, torus=False)
         self.running = True
+        self.exit_events = []
+        self.person_data = []
+        self.obstacles = set()
 
         # Parámetros de puertas: si no envían anchos, 1.0 m por defecto
         if exit_widths is None:
@@ -74,24 +77,84 @@ class EvacuationModel(Model):
         self.obstacles = set()  # si luego agregas paredes internas, añádelas aquí
         self.dist_field = bfs_distance_field(self.width, self.height, self.exit_positions, self.obstacles)
 
-        # === Crear personas ===
+        
+        # === Crear personas con heterogeneidad realista ===
         self.exit_times = []
+        self.person_data = []  # para análisis post-simulación por grupo
+
         for _ in range(N):
+            # Posición aleatoria (evitar salidas)
             x = self.random.randrange(self.width)
             y = self.random.randrange(self.height)
-            # evitar spawnear sobre una salida
             while (x, y) in self.exit_positions:
                 x = self.random.randrange(self.width)
                 y = self.random.randrange(self.height)
+
+            # Muestrear atributos realistas
+            r = self.random.random()
+            if r < 0.15:  # 15% niños
+                tipo = "niño"
+                edad = self.random.randint(5, 12)
+                v_base = self.random.uniform(0.8, 1.0)    # m/s
+                familiaridad = self.random.random() < 0.20
+                pánico = self.random.uniform(0.2, 0.6)
+                cumplimiento = self.random.uniform(0.3, 0.7)
+                movilidad_reducida = False
+            elif r < 0.85:  # 70% adultos
+                tipo = "adulto"
+                edad = self.random.randint(13, 59)
+                v_base = self.random.uniform(1.2, 1.4)
+                familiaridad = self.random.random() < 0.70
+                pánico = self.random.uniform(0.1, 0.4)
+                cumplimiento = self.random.uniform(0.7, 1.0)
+                movilidad_reducida = False
+            elif r < 0.97:  # 12% adultos mayores
+                tipo = "adulto_mayor"
+                edad = self.random.randint(60, 85)
+                v_base = self.random.uniform(0.6, 0.9)
+                familiaridad = self.random.random() < 0.40
+                pánico = self.random.uniform(0.3, 0.7)
+                cumplimiento = self.random.uniform(0.5, 0.9)
+                movilidad_reducida = False
+            else:  # 3% discapacidad motriz
+                tipo = "discapacidad"
+                edad = self.random.randint(20, 70)
+                v_base = self.random.uniform(0.3, 0.6)
+                familiaridad = self.random.random() < 0.50
+                pánico = self.random.uniform(0.4, 0.8)
+                cumplimiento = self.random.uniform(0.3, 0.8)
+                movilidad_reducida = True
+
+            # Convertir velocidad a celdas/tick (suponiendo: 1 celda = 0.5 m, Δt = 0.1 s)
+            # v (m/s) → celdas/tick = v * Δt / 0.5 = v * 0.2
+            v_cells = max(1, min(3, int(v_base * 0.2)))  # clamping: 1–3 celdas/step
 
             agent = PersonAgent(
                 self.next_id(),
                 self,
                 pos=(x, y),
-                v_cells_per_step=persons_speed_cells
+                tipo=tipo,
+                edad=edad,
+                v_cells_per_step=v_cells,
+                pánico=pánico,
+                familiaridad=familiaridad,
+                cumplimiento=cumplimiento,
+                movilidad_reducida=movilidad_reducida,
             )
             self.grid.place_agent(agent, (x, y))
             self.schedule.add(agent)
+
+            # Guardar datos para métricas post-simulación
+            self.person_data.append({
+                "id": agent.unique_id,
+                "tipo": tipo,
+                "edad": edad,
+                "v_base": v_base,
+                "pánico": pánico,
+                "familiaridad": familiaridad,
+                "cumplimiento": cumplimiento,
+                "movilidad_reducida": movilidad_reducida,
+            })
 
         # === DataCollector ===
         self.datacollector = DataCollector(
@@ -117,4 +180,4 @@ class EvacuationModel(Model):
         # detener si ya no quedan personas
         any_left = any(isinstance(a, PersonAgent) for a in self.schedule.agents)
         if not any_left:
-            self.running = False
+            self.   ning = False

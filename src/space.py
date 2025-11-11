@@ -44,3 +44,7 @@ def neighbors_moore(x, y, width, height):
             nx, ny = x + dx, y + dy
             if 0 <= nx < width and 0 <= ny < height:
                 yield nx, ny
+
+def update_distance_field(width, height, exit_positions, obstacles=None):
+    """Versión para actualizar campo existente después de cambios"""
+    return bfs_distance_field(width, height, exit_positions, obstacles)

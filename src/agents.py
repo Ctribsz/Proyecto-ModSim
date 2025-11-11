@@ -15,12 +15,13 @@ class ExitAgent(Agent):
         self.pos = pos
         self.capacity_ps = capacity_ps
         self.service_credit = 0.0
+        self.exit_count = 0  # Contador para throughput
 
     def step(self):
-        # acumular capacidad
+        # Acumular capacidad
         self.service_credit += self.capacity_ps * self.model.time_step
 
-        # recolectar candidatos (personas esperando junto a la salida)
+        # Recoger candidatos (personas esperando junto a la salida)
         x, y = self.pos
         candidates = []
         for nx, ny in neighbors_moore(x, y, self.model.width, self.model.height):
@@ -29,21 +30,21 @@ class ExitAgent(Agent):
                 if isinstance(a, PersonAgent) and (not a.evacuated) and a.target_exit is self and a.state == "WAITING":
                     candidates.append(a)
 
-        # servir hasta 'credit' personas
+        # Servir hasta 'credit' personas
         k = int(self.service_credit)
         served = 0
-        # orden aleatorio para no sesgar
-        random.shuffle(candidates)
+        random.shuffle(candidates)  # Orden aleatorio para no sesgar
         for a in candidates:
             if served >= k:
                 break
-            # evacuar
+            # Evacuar
             a.evacuated = True
             t_now = self.model.schedule.steps * self.model.time_step
             a.t_exit = t_now
-            self.model.exit_times.append(t_now)
+            self.model.exit_events.append({"id": a.unique_id, "t_exit": t_now})
+            self.exit_count += 1  # ¡CORREGIDO: solo una vez!
 
-            # remover del grid/schedule
+            # Remover del grid/schedule
             try:
                 self.model.grid.remove_agent(a)
             except Exception:
@@ -59,100 +60,152 @@ class ExitAgent(Agent):
 
 class PersonAgent(Agent):
     """
-    Persona que se dirige a la salida con menor distancia BFS.
-    Estados:
-      - MOVING: se mueve hacia la salida objetivo
-      - WAITING: anclado a una salida (en celda adyacente) esperando servicio
-      - (al evacuar se elimina del modelo)
+    Persona con atributos realistas: edad, movilidad, pánico, familiaridad, cumplimiento.
+    Estados: MOVING → WAITING → (evacuado y removido)
     """
-    def __init__(self, unique_id, model, pos, v_cells_per_step=1):
+    def __init__(
+        self,
+        unique_id,
+        model,
+        pos,
+        tipo="adulto",
+        edad=30,
+        v_cells_per_step=1,
+        pánico=0.2,
+        familiaridad=True,
+        cumplimiento=1.0,
+        movilidad_reducida=False,
+    ):
         super().__init__(unique_id, model)
         self.pos = pos
         self.evacuated = False
         self.t_exit = None
+        self.tipo = tipo
+        self.edad = edad
         self.v_cells_per_step = v_cells_per_step
+        self.pánico = pánico
+        self.familiaridad = familiaridad
+        self.cumplimiento = cumplimiento
+        self.movilidad_reducida = movilidad_reducida
         self.state = "MOVING"
-        self.target_exit = None  # ExitAgent elegido actualmente
+        self.target_exit = None
+        self.reelecciones = 0
+        self.preferred_exit_id = None  # para modelar familiaridad
 
-    # ---------------------------
+    # --------------------------------------------------
     def _choose_best_exit(self):
-        """
-        Elige la salida con menor distancia BFS desde la posición actual.
-        Si hay empate, incorpora heurística ligera de cola (menor credit esperado).
-        """
-        x, y = self.pos
-        best = []
-        best_val = float("inf")
+        """Elige salida con utilidad: distancia, congestión, pánico, familiaridad."""
+        if not self.model.exits:
+            return None
+
+        opciones = []
         for ex in self.model.exits:
-            d = self.model.dist_field[y, x]  # distancia a la salida más cercana (global)
-            # pequeña penalización por cola (inversa de credit disponible)
-            # Nota: esto es un proxy muy barato; para colas reales, medir candidatos WAITING por salida.
-            pen = 0.0
-            best_val = min(best_val, d + pen)
+            d = self.model.dist_field[self.pos[1], self.pos[0]]  # distancia global
 
-        # recolectar empatadas (con misma mejor distancia global)
-        for ex in self.model.exits:
-            d = self.model.dist_field[y, x]
-            if abs((d) - best_val) < 1e-9:
-                best.append(ex)
+            # Estimar congestión: agentes WAITING cerca de esta salida
+            x_ex, y_ex = ex.pos
+            cola = 0
+            for nx, ny in neighbors_moore(x_ex, y_ex, self.model.width, self.model.height):
+                for a in self.model.grid.get_cell_list_contents([(nx, ny)]):
+                    if isinstance(a, PersonAgent) and a.state == "WAITING" and a.target_exit is ex:
+                        cola += 1
 
-        # aleatorizar entre empatadas
-        return random.choice(best) if best else (self.model.exits[0] if self.model.exits else None)
+            # Utilidad negativa (minimizar)
+            utilidad = d + 0.5 * cola  # mayor distancia o cola → peor
 
+            # Bonus por familiaridad (si ya usó esta salida antes o conoce el lugar)
+            if self.familiaridad and self.preferred_exit_id is not None and ex.unique_id == self.preferred_exit_id:
+                utilidad -= 0.3
+
+            # Ruido por pánico: más indecisión si pánico alto
+            if self.pánico > 0.6:
+                utilidad += np.random.uniform(-0.4, 0.4)
+
+            opciones.append((utilidad, ex))
+
+        # Escoger con probabilidad softmax
+        utils, exits = zip(*opciones)
+        utils = np.array(utils)
+        # Evitar overflow
+        utils = utils - np.max(utils)
+        probs = np.exp(-utils)  # menos utilidad → más probabilidad
+        probs = probs / probs.sum()
+        idx = np.random.choice(len(exits), p=probs)
+        elegida = exits[idx]
+
+        # Recordar salida elegida para modelar aprendizaje/familiaridad
+        if self.familiaridad and self.preferred_exit_id is None:
+            self.preferred_exit_id = elegida.unique_id
+
+        return elegida
+
+    # --------------------------------------------------
     def _is_adjacent_to_exit(self, ex):
-        """¿Está en una celda vecina (Moore) a la salida ex?"""
         if ex is None:
             return False
         ex_x, ex_y = ex.pos
         x, y = self.pos
-        return max(abs(ex_x - x), abs(ex_y - y)) == 1 or (ex_x == x and ex_y == y)
+        return max(abs(ex_x - x), abs(ex_y - y)) <= 1
 
+    # --------------------------------------------------
     def _best_neighbor_step(self):
-        """
-        Elige vecino que reduzca la distancia BFS hacia CUALQUIER salida.
-        Usa el campo global dist_field (mínimo a salidas).
-        Permite quedarse si no hay mejora.
-        """
         x, y = self.pos
-        candidates = [(x, y)]
         best_val = self.model.dist_field[y, x]
-        best_cells = [ (x, y) ]
+        best_cells = [(x, y)]
 
         for nx, ny in neighbors_moore(x, y, self.model.width, self.model.height):
             if (nx, ny) in self.model.obstacles:
                 continue
             val = self.model.dist_field[ny, nx]
-            if val < best_val - 1e-9:
+            if val < best_val - 1e-6:
                 best_val = val
                 best_cells = [(nx, ny)]
-            elif abs(val - best_val) < 1e-9:
+            elif abs(val - best_val) < 1e-6:
                 best_cells.append((nx, ny))
 
         return random.choice(best_cells)
 
-    # ---------------------------
+    # --------------------------------------------------
     def step(self):
         if self.evacuated:
             return
 
         if self.state == "WAITING":
-            # no se mueve; el ExitAgent lo evacuará cuando tenga capacidad
+            # Mientras espera, puede reconsiderar si el pánico es alto o el objetivo desaparece
+            valid_exit = False
+            if self.target_exit is not None:
+                valid_exit = any(ex.unique_id == self.target_exit.unique_id for ex in self.model.exits)
+            
+            if not valid_exit or (self.pánico > 0.7 and self.random.random() < 0.05):
+                self.target_exit = self._choose_best_exit()
+                if self.target_exit:
+                    self.state = "MOVING"  # volver a moverse hacia nueva salida
             return
 
-        # asegurar objetivo
-        if (self.target_exit is None) or (self.target_exit not in self.model.exits):
+        # Reevaluar salida cada 10 steps (simula indecisión realista)
+        valid_exit = False
+        if self.target_exit is not None:
+            valid_exit = any(ex.unique_id == self.target_exit.unique_id for ex in self.model.exits)
+        
+        if self.model.schedule.steps % 10 == 0 or not valid_exit:
+            old_exit = self.target_exit
+            self.target_exit = self._choose_best_exit()
+            if old_exit is not self.target_exit and self.target_exit is not None:
+                self.reelecciones += 1
+
+        # Si aún no tiene objetivo, asignar uno
+        if self.target_exit is None:
             self.target_exit = self._choose_best_exit()
 
-        # avanzar v_cells_per_step micro-pasos
+        # Avanzar v_cells_per_step micro-pasos
         steps_left = self.v_cells_per_step
-        while steps_left > 0 and (not self.evacuated) and self.state == "MOVING":
+        while steps_left > 0 and not self.evacuated and self.state == "MOVING":
             new_pos = self._best_neighbor_step()
             self.model.grid.move_agent(self, new_pos)
 
-            # ¿adyacente a la salida objetivo? -> anclarse a cola (WAITING)
-            if self._is_adjacent_to_exit(self.target_exit):
+            # Si llega adyacente o encima de su salida objetivo → anclarse
+            if self.target_exit is not None and self._is_adjacent_to_exit(self.target_exit):
                 self.state = "WAITING"
-                # quedarse en esta celda; el ExitAgent decidirá cuándo evacuar
                 break
 
             steps_left -= 1
