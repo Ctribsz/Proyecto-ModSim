@@ -58,7 +58,7 @@ Este proyecto implementa un **modelo basado en agentes (MBA)** para simular la e
 
 ## 📊 Interpretando los Resultados
 
-### Tiempos Individuales (como en tu captura)
+### Tiempos Individuales 
 - **`id`**: Identificador único de cada agente (persona)
 - **`t_exit`**: Tiempo en segundos cuando la persona logra evacuar
 - **Interpretación**: 
